@@ -177,6 +177,13 @@ export function translateRequest(sourceFormat, targetFormat, model, body, stream
   return result;
 }
 
+// Undo request-side tool renames on a same-format response chunk: the Claude
+// OAuth cloak suffix (decloakStreamChunk) and executor renames (restoreToolNames).
+// Shared by translateResponse() and the passthrough stream, which never calls it.
+export function restoreSameFormatToolNames(chunk, toolNameMap) {
+  return restoreToolNames(decloakStreamChunk(chunk, toolNameMap), toolNameMap);
+}
+
 // Translate response chunk: target -> openai -> source
 export function translateResponse(targetFormat, sourceFormat, chunk, state) {
   ensureInitialized();
@@ -185,7 +192,7 @@ export function translateResponse(targetFormat, sourceFormat, chunk, state) {
   // even when no format conversion is needed, so streamed tool_use blocks must
   // be decloaked here or the client sees an unknown ("_ide"-suffixed) tool.
   if (sourceFormat === targetFormat) {
-    return [restoreToolNames(decloakStreamChunk(chunk, state?.toolNameMap), state?.toolNameMap)];
+    return [restoreSameFormatToolNames(chunk, state?.toolNameMap)];
   }
 
   let results = [chunk];
