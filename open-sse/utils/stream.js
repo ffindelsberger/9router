@@ -1,8 +1,10 @@
 import { translateResponse, initState, restoreSameFormatToolNames } from "../translator/index.js";
 import { FORMATS } from "../translator/formats.js";
+import { PROVIDERS } from "../config/providers.js";
+import { liftReasoningAliases } from "../translator/concerns/reasoning.js";
 import { trackPendingRequest, appendRequestLog } from "@/lib/usageDb.js";
 import { extractUsage, mergeUsage, hasValidUsage, estimateUsage, logUsage, addBufferToUsage, filterUsageForFormat, COLORS } from "./usageTracking.js";
-import { parseSSELine, hasValuableContent, fixInvalidId, formatSSE } from "./streamHelpers.js";
+import { parseSSELine, hasValuableContent, fixInvalidId, formatSSE, ensureStreamToolCallIds } from "./streamHelpers.js";
 import { getOpenAIResponsesEventName, isOpenAIResponsesTerminalEvent, formatIncompleteOpenAIResponsesStreamFailure } from "./responsesStreamHelpers.js";
 import { dbg, isDebugEnabled } from "./debugLog.js";
 
@@ -61,6 +63,12 @@ export function createSSEStream(options = {}) {
   let buffer = "";
   let usage = null;
 
+  // Tool-call ids already sent to the client, keyed by the tool-call index.
+  // A late fragment that opens a NEW index without an id must not reach the
+  // client as-is: strict OpenAI-compatible SDKs abort the turn on a
+  // tool_call without a string id (#4992).
+  const seenToolCallIds = new Map();
+
   // Per-stream decoder with stream:true to correctly handle multi-byte chars split across chunks
   const decoder = new TextDecoder("utf-8", { fatal: false });
 
@@ -89,6 +97,12 @@ export function createSSEStream(options = {}) {
   let streamDoneSent = false;  // track duplicate [DONE] across transform + flush
   let finalized = false;
   let completionFlushTimer = null;
+
+  // Lane quirk: upstream streams thinking under the OpenRouter aliases
+  // (`reasoning` / `reasoning_details[]`) instead of reasoning_content — OpenCode
+  // Free's MiMo route does. Lift it on every passthrough delta so OpenAI-shaped
+  // clients, the thinking accumulation below and usage accounting see the text.
+  const liftAliases = mode === STREAM_MODE.PASSTHROUGH && !!PROVIDERS[provider]?.quirks?.reasoningAliasFields;
 
   // Usage/logging tail, callable from transform() as well as flush(): a client that
   // closes right after the terminal event cancels the reader, and flush() never runs.
@@ -164,11 +178,33 @@ export function createSSEStream(options = {}) {
           let injectedUsage = false;
           let responsesTerminal = false;
 
+          // Upstream already sent the sentinel; flush() must not append a second one.
+          if (trimmed.startsWith("data:") && trimmed.slice(5).trim() === "[DONE]") streamDoneSent = true;
+
           if (trimmed.startsWith("data:") && trimmed.slice(5).trim() !== "[DONE]") {
             try {
               let parsed = JSON.parse(trimmed.slice(5).trim());
 
               const idFixed = fixInvalidId(parsed);
+
+              // A fragment that opens a new tool-call index without an id breaks
+              // strict OpenAI-compatible clients. Mint/reuse one before the
+              // chunk reaches the client.
+              const toolCallIdFixed = ensureStreamToolCallIds(parsed, seenToolCallIds);
+
+              // Restore caller tool names renamed on the request side: the
+              // fingerprint alias (read -> read_client, #4986) and the Claude
+              // OAuth "_ide" cloak suffix. Same-format streams never go through
+              // translateResponse(), so without this the client receives a call
+              // to a tool it never declared.
+              let toolNameRestored = false;
+              if (toolNameMap?.size) {
+                const restored = restoreSameFormatToolNames(parsed, toolNameMap);
+                if (restored !== parsed) {
+                  parsed = restored;
+                  toolNameRestored = true;
+                }
+              }
 
               // Ensure OpenAI-required fields are present on streaming chunks (Letta compat)
               let fieldsInjected = false;
@@ -191,6 +227,20 @@ export function createSSEStream(options = {}) {
                 }
               }
 
+              // Alias lanes: expose thinking as reasoning_content (additive) before
+              // the valuable-content check, so reasoning-only chunks survive.
+              if (liftAliases && parsed?.choices) {
+                for (const choice of parsed.choices) {
+                  if (choice?.delta) {
+                    const lifted = liftReasoningAliases(choice.delta);
+                    if (lifted !== choice.delta) {
+                      choice.delta = lifted;
+                      fieldsInjected = true;
+                    }
+                  }
+                }
+              }
+
               // Strip empty tool_calls arrays that break AI SDK reasoning tracking.
               // Some providers (e.g. CodeBuddy CN) include `"tool_calls": []` in
               // every streaming delta. @ai-sdk/openai-compatible checks
@@ -202,18 +252,6 @@ export function createSSEStream(options = {}) {
                     delete choice.delta.tool_calls;
                     fieldsInjected = true;
                   }
-                }
-              }
-
-              // Restore client tool names renamed on the request side (Claude OAuth
-              // "_ide" cloak suffix, executor renames). Same-format streams land here
-              // instead of translateResponse(), so without this the client receives
-              // the renamed tool_use and rejects it as an unknown tool.
-              if (toolNameMap?.size) {
-                const restored = restoreSameFormatToolNames(parsed, toolNameMap);
-                if (restored !== parsed) {
-                  parsed = restored;
-                  fieldsInjected = true;
                 }
               }
 
@@ -252,7 +290,7 @@ export function createSSEStream(options = {}) {
                 parsed.usage = filterUsageForFormat(buffered, FORMATS.OPENAI);
                 output = `data: ${JSON.stringify(parsed)}\n`;
                 injectedUsage = true;
-              } else if (idFixed || fieldsInjected) {
+              } else if (idFixed || fieldsInjected || toolCallIdFixed || toolNameRestored) {
                 output = `data: ${JSON.stringify(parsed)}\n`;
                 injectedUsage = true;
               }
@@ -442,7 +480,12 @@ export function createSSEStream(options = {}) {
         if (remaining) buffer += remaining;
 
         if (mode === STREAM_MODE.PASSTHROUGH) {
-          if (buffer) {
+          // An unterminated trailing "data: [DONE]" is the upstream sentinel: don't
+          // forward it raw (it would glue onto the properly framed one appended
+          // below, #5592).
+          const tail = buffer.trim();
+          const tailIsDone = tail.startsWith("data:") && tail.slice(5).trim() === "[DONE]";
+          if (!tailIsDone && buffer) {
             let output = buffer;
             if (buffer.startsWith("data:") && !buffer.startsWith("data: ")) {
               output = "data: " + buffer.slice(5);
